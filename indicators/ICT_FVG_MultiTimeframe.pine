@@ -1,0 +1,309 @@
+//@version=6
+// =============================================================================
+// ICT Fair Value Gaps — Multi-Timeframe
+// -----------------------------------------------------------------------------
+// Detecta Fair Value Gaps (FVG) de la metodologia ICT en 8 temporalidades fijas
+// (1m, 5m, 15m, 1H, 4H, D, W, M) de forma simultanea, independientemente de la
+// temporalidad en la que este el chart. Cada FVG se dibuja como un box.new()
+// (rectangulo nativo de Pine) con una label.new() indicando su temporalidad.
+//
+// Reglas de diseno acordadas:
+//  - Solo se muestran temporalidades >= a la temporalidad del chart (una
+//    temporalidad menor al chart se desactiva automaticamente: no hay datos
+//    intrabar confiables sin usar request.security_lower_tf, que tiene
+//    historial limitado).
+//  - Se mantienen como maximo N FVG no mitigados por temporalidad (input),
+//    por defecto 20 -> se descarta el mas antiguo al superar el limite.
+//  - Un FVG se borra cuando el CIERRE de una vela del chart atraviesa
+//    completamente el rango del gap (mitigacion total).
+//  - El borde derecho del rectangulo se extiende en vivo hasta la vela
+//    actual mientras el FVG siga activo (no mitigado).
+//  - Deteccion sin repintado: siempre se evalua el patron de 3 velas usando
+//    velas YA CERRADAS de la temporalidad objetivo (offsets [1],[2],[3]),
+//    nunca la vela en formacion.
+//  - Filtro de tamano minimo (opcional, activado por defecto): se ignoran
+//    los FVG cuyo tamano (top-bottom) sea menor a ATR(atrLen) * atrMult,
+//    calculado en la temporalidad objetivo (evita ruido en baja volatilidad).
+//  - Inversion FVG (IFVG, opcional, activado por defecto): cuando un FVG se
+//    mitiga por completo, en vez de borrarse se invierte (misma zona de
+//    precio, polaridad opuesta) y se reclasifica como IFVG, con su propio
+//    color (alcista/bajista) y limite de cantidad. Se borra definitivamente
+//    cuando esa nueva zona tambien se mitiga por completo.
+//  - Balanced Price Range (BPR, opcional, activado por defecto): cuando un
+//    FVG nuevo se solapa en precio con cualquier FVG activo de polaridad
+//    opuesta EN LA MISMA temporalidad, se dibuja la zona de interseccion
+//    como BPR. Es neutral (no alcista/bajista): se borra cuando el cierre
+//    de una vela sale por completo del rango del BPR, en cualquier direccion.
+// =============================================================================
+
+indicator("ICT Fair Value Gaps - Multi-Timeframe", shorttitle = "ICT FVG", overlay = true, max_boxes_count = 500, max_labels_count = 500)
+
+// ---------------------------------------------------------------------------
+// Inputs — activar/desactivar y color por temporalidad
+// ---------------------------------------------------------------------------
+grpTF = "Temporalidades"
+show1   = input.bool(true,  "1 minuto",   inline = "tf1",   group = grpTF)
+col1    = input.color(#9E9E9E, "", inline = "tf1",   group = grpTF)
+show5   = input.bool(true,  "5 minutos",  inline = "tf5",   group = grpTF)
+col5    = input.color(#2962FF, "", inline = "tf5",   group = grpTF)
+show15  = input.bool(true,  "15 minutos", inline = "tf15",  group = grpTF)
+col15   = input.color(#00BCD4, "", inline = "tf15",  group = grpTF)
+show60  = input.bool(true,  "1 hora",     inline = "tf60",  group = grpTF)
+col60   = input.color(#4CAF50, "", inline = "tf60",  group = grpTF)
+show240 = input.bool(true,  "4 horas",    inline = "tf240", group = grpTF)
+col240  = input.color(#FF9800, "", inline = "tf240", group = grpTF)
+showD   = input.bool(true,  "Diario",     inline = "tfD",   group = grpTF)
+colD    = input.color(#E91E63, "", inline = "tfD",   group = grpTF)
+showW   = input.bool(true,  "Semanal",    inline = "tfW",   group = grpTF)
+colW    = input.color(#9C27B0, "", inline = "tfW",   group = grpTF)
+showM   = input.bool(true,  "Mensual",    inline = "tfM",   group = grpTF)
+colM    = input.color(#795548, "", inline = "tfM",   group = grpTF)
+
+// ---------------------------------------------------------------------------
+// Inputs — configuracion general
+// ---------------------------------------------------------------------------
+grpCfg = "Configuracion"
+maxPerTF   = input.int(20, "Maximo de FVG activos (1m / 5m / 15m / 1H / 4H)", minval = 1, maxval = 50, group = grpCfg)
+maxD       = input.int(5,  "Maximo de FVG activos (Diario)",             minval = 1, maxval = 50, group = grpCfg)
+maxW       = input.int(3,  "Maximo de FVG activos (Semanal)",            minval = 1, maxval = 50, group = grpCfg)
+maxM       = input.int(2,  "Maximo de FVG activos (Mensual)",            minval = 1, maxval = 50, group = grpCfg)
+fillTransp = input.int(85, "Transparencia del relleno", minval = 0, maxval = 95, group = grpCfg)
+borderW    = input.int(1, "Grosor del borde", minval = 1, maxval = 4, group = grpCfg)
+showLabel  = input.bool(true, "Mostrar etiqueta de temporalidad", group = grpCfg)
+labelSize  = input.string(size.normal, "Tamano de etiqueta", options = [size.tiny, size.small, size.normal], group = grpCfg)
+labelPos   = input.string("Centro", "Posicion de etiqueta", options = ["Izquierda", "Centro", "Derecha"], group = grpCfg)
+showCE     = input.bool(true, "Mostrar linea CE (50% del FVG)", group = grpCfg)
+ceLineStyle = input.string(line.style_dashed, "Estilo linea CE", options = [line.style_dashed, line.style_dotted, line.style_solid], group = grpCfg)
+
+// Estilo de etiqueta derivado de la posicion elegida (se calcula una sola vez).
+lblStyle = labelPos == "Izquierda" ? label.style_label_right : labelPos == "Derecha" ? label.style_label_left : label.style_label_center
+
+// ---------------------------------------------------------------------------
+// Inputs — filtro de tamano minimo (ATR)
+// ---------------------------------------------------------------------------
+grpATR       = "Filtro de tamano minimo (ATR)"
+useATRFilter = input.bool(true, "Ignorar FVG mas pequenos que X * ATR", group = grpATR)
+atrLen       = input.int(14, "Periodo del ATR", minval = 1, group = grpATR)
+atrMult      = input.float(0.25, "Multiplicador de ATR (tamano minimo del gap)", minval = 0.0, step = 0.05, group = grpATR)
+
+// ---------------------------------------------------------------------------
+// Inputs — Inversion FVG (IFVG)
+// ---------------------------------------------------------------------------
+grpIFVG     = "Inversion FVG (IFVG)"
+showIFVG    = input.bool(true, "Mostrar Inversion FVG (IFVG)", group = grpIFVG)
+colIFVGBull = input.color(#00E676, "Color IFVG alcista (soporte)",    group = grpIFVG)
+colIFVGBear = input.color(#FF1744, "Color IFVG bajista (resistencia)", group = grpIFVG)
+maxIFVG     = input.int(10, "Maximo de IFVG activos por temporalidad", minval = 1, maxval = 50, group = grpIFVG)
+
+// ---------------------------------------------------------------------------
+// Inputs — Balanced Price Range (BPR)
+// ---------------------------------------------------------------------------
+grpBPR  = "Balanced Price Range (BPR)"
+showBPR = input.bool(true, "Mostrar Balanced Price Range (BPR)", group = grpBPR)
+colBPR  = input.color(#FFEB3B, "Color BPR", group = grpBPR)
+maxBPR  = input.int(10, "Maximo de BPR activos por temporalidad", minval = 1, maxval = 50, group = grpBPR)
+
+// ---------------------------------------------------------------------------
+// Tipo de dato — una zona de FVG con sus dibujos asociados
+// ---------------------------------------------------------------------------
+type FVG
+    box   zone
+    label lbl
+    line  midline
+    float top
+    float bottom
+    bool  isBull
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+// Borra los dibujos (box + label + linea CE) de un FVG.
+deleteFVG(FVG f) =>
+    box.delete(f.zone)
+    if not na(f.lbl)
+        label.delete(f.lbl)
+    if not na(f.midline)
+        line.delete(f.midline)
+
+
+// Vacia por completo un array de FVG, borrando sus dibujos.
+purgeArray(array<FVG> arr) =>
+    if array.size(arr) > 0
+        for i = array.size(arr) - 1 to 0
+            deleteFVG(array.get(arr, i))
+        array.clear(arr)
+
+// Una temporalidad solo es valida si es >= a la temporalidad del chart.
+tfAllowed(simple string tf) =>
+    timeframe.in_seconds(tf) >= timeframe.in_seconds()
+
+// Borde derecho "vivo": el cierre de la vela actual del chart.
+f_right() =>
+    time_close
+
+// ---------------------------------------------------------------------------
+// Motor principal: procesa una temporalidad completa (deteccion + gestion)
+// Cada llamada explicita a esta funcion (mas abajo) obtiene su PROPIO estado
+// persistente (arr, lastT) porque las variables `var` dentro de una funcion
+// se mantienen por sitio de llamada en Pine Script.
+// ---------------------------------------------------------------------------
+processTF(simple string tf, simple string tfText, bool show, color col, int maxCount) =>
+    var array<FVG> arr = array.new<FVG>()
+    var array<FVG> ifvgArr = array.new<FVG>()
+    var array<FVG> bprArr = array.new<FVG>()
+    var float lastT = na
+
+    allowed = tfAllowed(tf)
+
+    // request.security (y el ta.atr() dentro de ella) se llama SIEMPRE, sin
+    // condicionar por show/allowed, para que el calculo interno del ATR sea
+    // consistente bar a bar (evita el warning/riesgo de recalculo de Pine).
+    [h1, h2, h3, l1, l2, l3, t1, t3, atr1] = request.security(
+         syminfo.tickerid, tf,
+         [high[1], high[2], high[3], low[1], low[2], low[3], time[1], time[3], ta.atr(atrLen)[1]],
+         lookahead = barmerge.lookahead_off)
+
+    if show and allowed
+        // Solo procesar cuando cierra una nueva vela de esta temporalidad.
+        // (na(lastT) se comprueba explicitamente: comparar con != contra na
+        // no es fiable en Pine Script).
+        if not na(t1) and (na(lastT) or t1 != lastT)
+            lastT := t1
+            bullOK = l1 > h3   // FVG alcista (BISI): low de vela3 > high de vela1
+            bearOK = h1 < l3   // FVG bajista (SIBI): high de vela3 < low de vela1
+
+            if bullOK or bearOK
+                top    = bullOK ? l1 : l3
+                bottom = bullOK ? h3 : h1
+                gapSize = top - bottom
+                sizeOK  = not useATRFilter or na(atr1) or gapSize >= atr1 * atrMult
+
+                if sizeOK
+                    b = box.new(left = t3, top = top, right = f_right(), bottom = bottom,
+                         xloc = xloc.bar_time, border_color = col, border_width = borderW,
+                         bgcolor = color.new(col, fillTransp))
+                    lblX0 = labelPos == "Izquierda" ? t3 : labelPos == "Derecha" ? f_right() : math.round(math.avg(t3, f_right()))
+                    lb = showLabel ? label.new(x = lblX0, y = (top + bottom) / 2, text = tfText,
+                         xloc = xloc.bar_time, style = lblStyle,
+                         size = labelSize, color = color.new(col, 100), textcolor = col) : na
+                    ml = showCE ? line.new(x1 = t3, y1 = (top + bottom) / 2, x2 = f_right(), y2 = (top + bottom) / 2,
+                         xloc = xloc.bar_time, color = color.new(col, 30), style = ceLineStyle, width = 1) : na
+                    array.push(arr, FVG.new(zone = b, lbl = lb, midline = ml, top = top, bottom = bottom, isBull = bullOK))
+
+                    if array.size(arr) > maxCount
+                        deleteFVG(array.shift(arr))
+
+                    // BPR: comparar el FVG recien creado contra todos los FVG
+                    // activos de polaridad OPUESTA en esta misma temporalidad.
+                    // Cualquier solape de precio forma una zona BPR.
+                    if showBPR
+                        for k = 0 to array.size(arr) - 2
+                            other = array.get(arr, k)
+                            if other.isBull != bullOK
+                                bprTop    = math.min(top, other.top)
+                                bprBottom = math.max(bottom, other.bottom)
+                                if bprTop > bprBottom
+                                    bb = box.new(left = t3, top = bprTop, right = f_right(), bottom = bprBottom,
+                                         xloc = xloc.bar_time, border_color = colBPR, border_width = borderW,
+                                         bgcolor = color.new(colBPR, fillTransp))
+                                    lblXB = labelPos == "Izquierda" ? t3 : labelPos == "Derecha" ? f_right() : math.round(math.avg(t3, f_right()))
+                                    lbb = showLabel ? label.new(x = lblXB, y = (bprTop + bprBottom) / 2, text = tfText + " BPR",
+                                         xloc = xloc.bar_time, style = lblStyle,
+                                         size = labelSize, color = color.new(colBPR, 100), textcolor = colBPR) : na
+                                    mlb = showCE ? line.new(x1 = t3, y1 = (bprTop + bprBottom) / 2, x2 = f_right(), y2 = (bprTop + bprBottom) / 2,
+                                         xloc = xloc.bar_time, color = color.new(colBPR, 30), style = ceLineStyle, width = 1) : na
+                                    array.push(bprArr, FVG.new(zone = bb, lbl = lbb, midline = mlb, top = bprTop, bottom = bprBottom, isBull = true))
+                                    if array.size(bprArr) > maxBPR
+                                        deleteFVG(array.shift(bprArr))
+    else
+        purgeArray(arr)
+        purgeArray(ifvgArr)
+        purgeArray(bprArr)
+
+    // Extender en vivo + revisar mitigacion (cierre completo del gap).
+    // Al mitigarse, si showIFVG esta activo, la zona se INVIERTE (misma caja,
+    // polaridad opuesta, colores de IFVG) en vez de borrarse.
+    if show and allowed and array.size(arr) > 0
+        for i = array.size(arr) - 1 to 0
+            f = array.get(arr, i)
+            mitigated = f.isBull ? close < f.bottom : close > f.top
+            if mitigated
+                if showIFVG
+                    newIsBull = not f.isBull
+                    ifvgCol = newIsBull ? colIFVGBull : colIFVGBear
+                    box.set_border_color(f.zone, ifvgCol)
+                    box.set_bgcolor(f.zone, color.new(ifvgCol, fillTransp))
+                    if not na(f.lbl)
+                        label.set_text(f.lbl, tfText + " IFVG")
+                        label.set_color(f.lbl, color.new(ifvgCol, 100))
+                        label.set_textcolor(f.lbl, ifvgCol)
+                    if not na(f.midline)
+                        line.set_color(f.midline, color.new(ifvgCol, 30))
+                    array.push(ifvgArr, FVG.new(zone = f.zone, lbl = f.lbl, midline = f.midline, top = f.top, bottom = f.bottom, isBull = newIsBull))
+                    if array.size(ifvgArr) > maxIFVG
+                        deleteFVG(array.shift(ifvgArr))
+                else
+                    deleteFVG(f)
+                removed = array.remove(arr, i)
+                doneFlag = true
+            else
+                box.set_right(f.zone, f_right())
+                if not na(f.lbl)
+                    leftT = box.get_left(f.zone)
+                    lblX1 = labelPos == "Izquierda" ? leftT : labelPos == "Derecha" ? f_right() : math.round(math.avg(leftT, f_right()))
+                    label.set_x(f.lbl, lblX1)
+                if not na(f.midline)
+                    line.set_x2(f.midline, f_right())
+                doneFlag = true
+
+    // Extender en vivo + revisar la SEGUNDA mitigacion de los IFVG (se borran
+    // definitivamente, no se vuelven a invertir).
+    if show and allowed and array.size(ifvgArr) > 0
+        for j = array.size(ifvgArr) - 1 to 0
+            g = array.get(ifvgArr, j)
+            gMitigated = g.isBull ? close < g.bottom : close > g.top
+            if gMitigated
+                deleteFVG(g)
+                removedG = array.remove(ifvgArr, j)
+                doneFlag2 = true
+            else
+                box.set_right(g.zone, f_right())
+                if not na(g.lbl)
+                    leftG = box.get_left(g.zone)
+                    lblX2 = labelPos == "Izquierda" ? leftG : labelPos == "Derecha" ? f_right() : math.round(math.avg(leftG, f_right()))
+                    label.set_x(g.lbl, lblX2)
+                if not na(g.midline)
+                    line.set_x2(g.midline, f_right())
+                doneFlag2 = true
+
+    // Extender en vivo + revisar mitigacion del BPR (neutral: se borra si el
+    // cierre sale por completo del rango, en cualquier direccion).
+    if show and allowed and array.size(bprArr) > 0
+        for m = array.size(bprArr) - 1 to 0
+            bp = array.get(bprArr, m)
+            bpMitigated = close < bp.bottom or close > bp.top
+            if bpMitigated
+                deleteFVG(bp)
+                removedBP = array.remove(bprArr, m)
+                doneFlag3 = true
+            else
+                box.set_right(bp.zone, f_right())
+                if not na(bp.lbl)
+                    leftBP = box.get_left(bp.zone)
+                    lblX3 = labelPos == "Izquierda" ? leftBP : labelPos == "Derecha" ? f_right() : math.round(math.avg(leftBP, f_right()))
+                    label.set_x(bp.lbl, lblX3)
+                if not na(bp.midline)
+                    line.set_x2(bp.midline, f_right())
+                doneFlag3 = true
+
+// ---------------------------------------------------------------------------
+// Ejecucion — una llamada por temporalidad
+// ---------------------------------------------------------------------------
+processTF("1",   "1m",  show1,   col1,   maxPerTF)
+processTF("5",   "5m",  show5,   col5,   maxPerTF)
+processTF("15",  "15m", show15,  col15,  maxPerTF)
+processTF("60",  "1H",  show60,  col60,  maxPerTF)
+processTF("240", "4H",  show240, col240, maxPerTF)
+processTF("D",   "D",   showD,   colD,   maxD)
+processTF("W",   "W",   showW,   colW,   maxW)
+processTF("M",   "M",   showM,   colM,   maxM)

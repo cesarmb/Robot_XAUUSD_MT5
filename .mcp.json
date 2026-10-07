@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "exa": {
+      "type": "http",
+      "url": "https://mcp.exa.ai/mcp?exaApiKey=f1b9588f-af47-4c1a-afa1-2135c7ebf0d5"
+    },
+    "notion": {
+      "type": "http",
+      "url": "https://mcp.notion.com/mcp"
+    },
+    "composio": {
+      "type": "http",
+      "url": "https://connect.composio.dev/mcp",
+      "headers": {
+        "x-consumer-api-key": "ck_b2pGn4WWXtuAxtFtKdDx"
+      }
+    }
+  }
+}

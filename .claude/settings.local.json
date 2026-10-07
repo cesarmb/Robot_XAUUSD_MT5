@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git clone *)",
+      "Bash(npm install *)",
+      "Read(//c/Users/csrmt/.claude/**)",
+      "Bash(npm audit *)",
+      "Bash(cmd //c scripts\\\\\\\\launch_tv_debug.bat)",
+      "Bash(cmd //c \"scripts\\\\launch_tv_debug.bat\")",
+      "Bash(node src/cli/index.js status)",
+      "Bash(curl -s http://127.0.0.1:9222/json/version)",
+      "Bash(echo \"exit:$?\")",
+      "Bash(node src/cli/index.js state)",
+      "Bash(node src/cli/index.js quote)",
+      "Bash(node src/cli/index.js values)",
+      "Bash(node src/cli/index.js values --help)",
+      "Bash(node -e ' *)",
+      "Bash(node src/cli/index.js data lines --filter \"Trend Pressure\")",
+      "Bash(node src/cli/index.js data labels --filter \"Trend Pressure\")",
+      "Bash(node src/cli/index.js data --help)",
+      "Bash(node src/cli/index.js data lines --help)",
+      "Bash(node src/cli/index.js data lines)",
+      "Bash(node src/cli/index.js data labels)",
+      "Bash(node src/cli/index.js data tables --filter \"Trend Pressure\")",
+      "Bash(node src/cli/index.js data labels --verbose)",
+      "Bash(node src/cli/index.js screenshot -r full)",
+      "Bash(node src/cli/index.js ohlcv --count 20)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://127.0.0.1:9222/json/version)",
+      "Bash(node src/cli/index.js pane list)",
+      "Bash(node src/cli/index.js ohlcv --count 40)",
+      "Bash(node src/cli/index.js ohlcv --count 65)",
+      "Bash(node src/cli/index.js ohlcv --count 90)",
+      "Bash(node src/cli/index.js ohlcv --count 300)",
+      "Bash(node src/cli/index.js ohlcv --help)"
+    ]
+  },
+  "enabledMcpjsonServers": [
+    "exa",
+    "notion",
+    "composio"
+  ]
+}

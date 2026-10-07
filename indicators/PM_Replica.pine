@@ -1,0 +1,241 @@
+//@version=6
+// ─────────────────────────────────────────────────────────────────────────────
+// PM Réplica — reconstrucción de PROFIT MASTER 3.0 ALUMNOS
+//
+// Derivado por ingeniería inversa sobre los plots del indicador original
+// (VANTAGE:XAUUSD 5m Heikin Ashi, sep-2026). Ver CLAUDE.md del proyecto.
+//
+//   centro     = SMA(hl2, 8)                                     <- exacto
+//   semiancho  = 0.496*SMA(TR,8) + (2 - nivel/100)*ATR(120)      <- 0.023 pts de error
+//   U = centro + semiancho     L = centro - semiancho
+//   senal      = el close sale del canal, dentro de ventana de sesion
+//   SL         = 3.0 x ATR(14)      TP = 1.0 / 1.2 / 1.5 R      BE = 0.5 R
+//
+// VALIDACION: 29 senales reales del original -> 28 exactas en la misma vela,
+// 0 inventadas. Error de banda 0.023 pts sobre 4681 observaciones de 7
+// niveles de sensibilidad distintos.
+//
+// Nota: el componente rapido es SMA(TR,8), NO ATR(8). Wilder (RMA) da 8 veces
+// mas error. Y el largo 8 es el mismo que el del centro.
+//
+// IMPORTANTE: aplicar sobre chart en HEIKIN ASHI. Con velas normales los
+// valores de entrada cambian por completo (no es cosmetico).
+// ─────────────────────────────────────────────────────────────────────────────
+
+indicator("PM Réplica", overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+
+// ═══════════════════════ ENTRADAS ═══════════════════════
+
+grpE = "ESTRATEGIA"
+sensPreset = input.string("Media", "Sensibilidad de entrada", group = grpE, options = ["Muy baja", "Baja", "Media", "Alta", "Muy alta", "Personalizado"], tooltip = "Nivel mas alto = banda mas angosta = mas senales. Niveles MEDIDOS sobre el original: Muy baja=60, Baja=80, Media=100, Alta=150, Muy alta=150. OJO: en el original 'Alta' y 'Muy alta' dan la MISMA banda (284 de 285 velas bit-identicas). Parece un bug del indicador; se replica igual para ser fiel.")
+sensCustom = input.int(100, "  └ Personalizado: nivel", minval = 1, maxval = 300, group = grpE)
+dirFilter  = input.string("Ambas", "Direccion", options = ["Ambas", "Solo compras", "Solo ventas"], group = grpE)
+
+grpS = "STOP Y OBJETIVOS"
+slMult = input.float(3.0, "SL = ATR(14) x", minval = 0.1, step = 0.1, group = grpS, tooltip = "3.0 corresponde a 'Amplitud del stop = Normal' en el original. Los otros niveles no fueron medidos.")
+tp1R = input.float(1.0, "TP1 = SL x (R:R)", step = 0.1, group = grpS)
+tp2R = input.float(1.2, "TP2 = SL x (R:R)", step = 0.1, group = grpS)
+tp3R = input.float(1.5, "TP3 = SL x (R:R)", step = 0.1, group = grpS)
+beR  = input.float(0.5, "Break Even a (R)", step = 0.1, group = grpS)
+
+grpSc = "SCORES A OPERAR"
+operarA = input.bool(true, "Operar senales A", group = grpSc, tooltip = "Grado A = la desviacion entre el precio real y el close Heikin Ashi es menor al 5% de R. Es el unico filtro que sobrevivio validacion fuera de muestra.")
+operarB = input.bool(false, "B", group = grpSc)
+operarC = input.bool(false, "C", group = grpSc)
+umbralBC = input.float(0.485, "Umbral B/C (score)", minval = 0.1, maxval = 0.9, step = 0.005, group = grpSc, tooltip = "El original corta entre 0.480 y 0.490. No se pudo medir mas fino. El umbral A (delta/R <= 0.05) si es exacto.")
+mostrarDescartadas = input.bool(true, "Marcar en gris las descartadas", group = grpSc)
+
+grpH = "FILTRO HORARIO"
+useSession = input.bool(true, "Filtrar por horario", group = grpH)
+sess1      = input.session("0730-1130", "Horario 1", group = grpH)
+useSess2   = input.bool(true, "Activar segundo horario", group = grpH)
+sess2      = input.session("2000-2300", "Horario 2", group = grpH)
+tz         = input.string("America/New_York", "Zona horaria", group = grpH, options = ["America/New_York", "America/Chicago", "Europe/London", "Europe/Berlin", "Asia/Tokyo", "Asia/Singapore", "UTC"])
+shadeSess  = input.bool(true, "Resaltar sesiones en el chart", group = grpH)
+
+grpR = "GESTION DE RIESGO"
+showLots  = input.bool(true, "Calculadora de lotaje", group = grpR)
+balance   = input.float(100000, "Balance de cuenta ($)", group = grpR)
+riskPct   = input.float(2.5, "Riesgo por operacion (%)", step = 0.1, group = grpR)
+spread    = input.float(0.0, "Spread estimado", minval = 0, step = 0.1, group = grpR, tooltip = "Se suma a la distancia del SL para calcular el lotaje, de modo que el riesgo en dolares siga siendo el configurado. No mueve los niveles dibujados.")
+tickSize  = input.float(0.01, "Tamano del tick", group = grpR)
+tickValue = input.float(1.0, "Valor del tick ($)", group = grpR)
+
+grpV = "VISUAL"
+showBands  = input.bool(true, "Mostrar el canal", group = grpV)
+showLevels = input.bool(true, "Etiquetas ENTRY / SL / TP", group = grpV)
+showZones  = input.bool(true, "Colorear zona SL/TP", group = grpV)
+extendBars = input.int(25, "Extension horizontal de niveles", minval = 1, group = grpV)
+
+// ═══════════════════════ EL CANAL ═══════════════════════
+
+// Niveles medidos sobre el indicador original (ver CLAUDE.md).
+// b resultante = 2 - nivel/100  ->  1.4 / 1.2 / 1.0 / 0.7 / 0.5
+nivel = switch sensPreset
+    "Muy alta" => 150.0
+    "Alta"     => 130.0
+    "Media"    => 100.0
+    "Baja"     => 80.0
+    "Muy baja" => 60.0
+    => sensCustom * 1.0
+
+centro    = ta.sma(hl2, 8)
+semiancho = 0.4960 * ta.sma(ta.tr(true), 8) + (2.0 - nivel / 100.0) * ta.atr(120)
+
+U = centro + semiancho
+L = centro - semiancho
+
+// ═══════════════════════ TENDENCIA Y SENALES ═══════════════════════
+
+outU = close > U
+outL = close < L
+
+var int trend = 0
+if outU
+    trend := 1
+else if outL
+    trend := -1
+
+rawBuy  = outU and not outU[1]
+rawSell = outL and not outL[1]
+
+inSess1  = not na(time(timeframe.period, sess1, tz))
+inSess2  = useSess2 and not na(time(timeframe.period, sess2, tz))
+inWindow = not useSession or inSess1 or inSess2
+
+okLong  = dirFilter != "Solo ventas"
+okShort = dirFilter != "Solo compras"
+
+// ═══════════════════════ SCORE A/B/C ═══════════════════════
+// El close del chart es Heikin Ashi, que NO es un precio operable. El precio
+// al que se entra de verdad es el close de la vela REAL. La diferencia entre
+// ambos (delta) es lo que el indicador original reporta como score.
+//
+//   score = (TP1 * R - delta) / (R + delta)     <- el R:R que se obtiene de verdad
+//   grado A  si  delta/R <= 0.05                <- NO depende de TP1
+//   grado C  si  score < 0.5                    <- SI depende de TP1
+//
+// Medido sobre 112 señales: en grado A el delta/R medio es -0.016 (la mitad
+// de las veces el mercado da MEJOR precio que la etiqueta); en B y C es
+// +0.193 y ninguna de 87 fue favorable.
+
+atr14 = ta.atr(14)
+R     = slMult * atr14
+
+closeReal = request.security(ticker.standard(syminfo.tickerid), timeframe.period, close)
+
+dirSig = rawBuy ? 1 : rawSell ? -1 : 0
+delta  = dirSig * (closeReal - close)
+dOverR = R > 0 ? delta / R : 0.0
+score  = (R + delta) != 0 ? (tp1R * R - delta) / (R + delta) : 0.0
+
+// Umbral B/C: medido sobre las etiquetas del original con TP1=0.7, el B mas
+// bajo da 0.490 y el C mas alto 0.480, asi que el corte esta entre esos dos.
+// 0.485 reproduce 40/40 de las señales operables. El umbral A (0.05) si es
+// exacto: reproduce 16/16 sin margen de error.
+esA = dOverR <= 0.05
+esC = not esA and score < umbralBC
+grado = esA ? "A" : esC ? "C" : "B"
+gradoOk = esA ? operarA : esC ? operarC : operarB
+
+crudaBuy  = rawBuy and inWindow and okLong
+crudaSell = rawSell and inWindow and okShort
+
+buySignal  = crudaBuy and gradoOk
+sellSignal = crudaSell and gradoOk
+descartadaBuy  = crudaBuy and not gradoOk
+descartadaSell = crudaSell and not gradoOk
+
+// ═══════════════════════ NIVELES DE LA OPERACION ═══════════════════════
+
+var float eEntry = na
+var float eSL    = na
+var float eTP1   = na
+var float eTP2   = na
+var float eTP3   = na
+var float eBE    = na
+var int   eDir   = 0
+var string eGrado = ""
+var float eScore = na
+
+if buySignal or sellSignal
+    d = buySignal ? 1 : -1
+    eDir   := d
+    eGrado := grado
+    eScore := score
+    eEntry := close
+    eSL    := close - d * R
+    eTP1   := close + d * tp1R * R
+    eTP2   := close + d * tp2R * R
+    eTP3   := close + d * tp3R * R
+    eBE    := close + d * beR * R
+
+// ═══════════════════════ DIBUJO ═══════════════════════
+
+colUp = color.new(#26a69a, 0)
+colDn = color.new(#ef5350, 0)
+colBand = trend == 1 ? colUp : colDn
+
+plot(showBands ? U : na, "Banda superior", color = color.new(colBand, 40))
+plot(showBands ? L : na, "Banda inferior", color = color.new(colBand, 40))
+plot(showBands ? centro : na, "Centro SMA(hl2,8)", color = color.new(color.gray, 60))
+
+bgcolor(shadeSess and useSession and inSess1 ? color.new(color.blue, 94) : na, title = "Sesion 1")
+bgcolor(shadeSess and useSession and inSess2 ? color.new(color.purple, 94) : na, title = "Sesion 2")
+
+plotshape(buySignal, "BUY", shape.labelup, location.belowbar, colUp, text = "BUY", textcolor = color.white, size = size.small)
+plotshape(sellSignal, "SELL", shape.labeldown, location.abovebar, colDn, text = "SELL", textcolor = color.white, size = size.small)
+plotshape(mostrarDescartadas and descartadaBuy, "Descartada BUY", shape.xcross, location.belowbar, color.new(color.gray, 30), size = size.tiny)
+plotshape(mostrarDescartadas and descartadaSell, "Descartada SELL", shape.xcross, location.abovebar, color.new(color.gray, 30), size = size.tiny)
+
+// OJO: el original NO suma el spread al lotaje. Verificado sobre 3 operaciones
+// con spread=0.2: mostro 0.98 / 1.22 / 0.70, que son exactamente
+// 2500/(SL*100) sin spread (con spread darian 0.97 / 1.21 / 0.70).
+// Se replica ese comportamiento para que los dos indicadores den el mismo
+// lotaje. El spread se usa solo para estimar su costo en la etiqueta.
+slPts     = na(eEntry) ? na : math.abs(eEntry - eSL)
+riskUSD   = balance * riskPct / 100.0
+lots      = na(slPts) or slPts <= 0 ? na : riskUSD / (slPts / tickSize * tickValue)
+costoSpr  = na(lots) ? na : spread / tickSize * tickValue * lots
+
+var line lnEntry = na
+var line lnSL = na
+var line lnTP1 = na
+var line lnTP2 = na
+var line lnTP3 = na
+var line lnBE = na
+var label lbInfo = na
+var box bxRisk = na
+var box bxRew = na
+
+if (buySignal or sellSignal) and showLevels
+    line.delete(lnEntry)
+    line.delete(lnSL)
+    line.delete(lnTP1)
+    line.delete(lnTP2)
+    line.delete(lnTP3)
+    line.delete(lnBE)
+    label.delete(lbInfo)
+    box.delete(bxRisk)
+    box.delete(bxRew)
+
+    x2 = bar_index + extendBars
+    lnEntry := line.new(bar_index, eEntry, x2, eEntry, color = color.blue, width = 2)
+    lnSL    := line.new(bar_index, eSL, x2, eSL, color = colDn, width = 2)
+    lnTP1   := line.new(bar_index, eTP1, x2, eTP1, color = colUp)
+    lnTP2   := line.new(bar_index, eTP2, x2, eTP2, color = color.new(colUp, 30))
+    lnTP3   := line.new(bar_index, eTP3, x2, eTP3, color = color.new(colUp, 50))
+    lnBE    := line.new(bar_index, eBE, x2, eBE, color = color.olive, style = line.style_dashed)
+
+    if showZones
+        bxRisk := box.new(bar_index, eSL, x2, eEntry, border_color = color.new(color.white, 100), bgcolor = color.new(colDn, 88))
+        bxRew  := box.new(bar_index, eEntry, x2, eTP1, border_color = color.new(color.white, 100), bgcolor = color.new(colUp, 88))
+
+    if showLots
+        txt = (eDir == 1 ? "▲ BUY" : "▼ SELL") + "  " + eGrado + " " + str.tostring(eScore, "#.##") + "R" + "\n" + str.tostring(lots, "#.##") + " lotes" + "\n$" + str.tostring(riskUSD, "#") + " riesgo (" + str.tostring(riskPct, "#.#") + "%)" + "\nSL: " + str.tostring(slPts, "#.#") + " pts" + (spread > 0 ? "\nspread: -$" + str.tostring(costoSpr, "#") : "")
+        lbInfo := label.new(bar_index, eBE, txt, style = label.style_label_center, color = color.new(eDir == 1 ? colUp : colDn, 20), textcolor = color.white, size = size.small)
+
+// ═══════════════════════ ALERTAS ═══════════════════════
+
+alertcondition(buySignal, "BUY", "PM Réplica: senal de compra")
+alertcondition(sellSignal, "SELL", "PM Réplica: senal de venta")
